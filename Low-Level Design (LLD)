@@ -1,0 +1,225 @@
+1) Core REST APIs (OpenAPI style)
+1.1 Create Payment (Client → Payments Service)
+
+POST /api/v1/payments
+Request:
+
+{
+  "clientRequestId": "uuid-1234", 
+  "customerId": "cust-001",
+  "walletId": "wallet-001",
+  "merchantId": "m-100",
+  "amount": 123.45,
+  "currency": "INR",
+  "items": [{"sku":"ABC","name":"T-Shirt","price":100,"qty":1}],
+  "callbackUrl": "https://merchant.example.com/webhook"
+}
+
+
+Response (202 Accepted if async):
+
+{ "paymentId":"pay-0001", "status":"PENDING", "message":"Accepted for processing" }
+
+
+Behavior: Payments Service assigns a paymentId, validates currency, checks idempotency by clientRequestId.
+
+1.2 Poll/Get Payment
+
+GET /api/v1/payments/{paymentId} → returns status: PENDING | COMPLETED | FAILED | COMPENSATED.
+
+1.3 Wallet Balance
+
+GET /api/v1/wallets/{walletId}/balance
+
+1.4 Merchant webhook endpoint (for merchant) — merchant provides URL; Notifications Service calls it.
+2) Database schema (recommended)
+
+Choice rationale: Financial correctness implies ACID. Use RDBMS (Postgres) for balances/ledger. Use Mongo for non-critical profile data if desired.
+
+Tables (SQL)
+
+wallets
+
+wallet_id PK, customer_id FK, currency, available_balance DECIMAL(18,2), reserved_balance DECIMAL(18,2), status, created_at, updated_at
+
+
+ledger_entries (append-only)
+
+entry_id PK, payment_id FK, wallet_id, merchant_id, entry_type ENUM('DEBIT','CREDIT','FEE','REVERSAL'), amount, currency, balance_after, status, metadata JSONB, created_at
+-- index on payment_id, wallet_id
+
+
+payments
+
+payment_id PK, client_request_id UNIQUE, customer_id, wallet_id, merchant_id, amount, currency, status ENUM('PENDING','COMPLETED','FAILED','COMPENSATED'), error_code, error_message, created_at, updated_at
+
+
+merchant_accounts
+
+merchant_id PK, account_identifier, settlement_currency, fee_rate NUMERIC, ledger_balance
+
+
+audit_events
+
+event_id PK, source_service, entity_type, entity_id, action, payload JSONB, created_by, created_at
+
+
+Indexes:
+
+payments(client_request_id) unique for idempotency
+
+wallets(customer_id) for fast lookup
+
+ledger_entries(payment_id) for transaction history
+
+3) Transactional sequence (detailed)
+
+Use Saga Orchestration implemented inside Payments Service for cross-service orchestration (simpler than distributed 2PC across microservices).
+
+Happy path
+
+Receive payment request → PENDING.
+
+Validate currency/merchant/wallet existence.
+
+Reserve funds: begin DB tx on Wallet Service: decrement available_balance and increment reserved_balance; create ledger_entries of type DEBIT with status = PENDING. (Single DB tx if wallet + ledger are in same DB)
+
+Persist payments record with status=PENDING.
+
+Call internal CreditMerchant step (could be local update to merchant ledger): create ledger entry for merchant with status = PENDING.
+
+Mark ledger_entries and payments as COMPLETED (commit).
+
+Publish event payment.completed to Kafka (topic payment.results).
+
+Notification Service consumes event and sends webhook to merchant + email/SMS to customer.
+
+Settlement Service picks payment for settlement batch (D+1) and initiates bank gateway transfer.
+
+Failure/compensation
+
+If CreditMerchant fails after reserve, run compensation: release funds (move from reserved_balance back to available_balance), create REVERSAL ledger entry, set payments.status = COMPENSATED or FAILED, notify parties.
+
+Why Saga? avoids distributed 2PC; compensations recorded in ledger so auditability remains.
+
+4) Idempotency and concurrency
+
+Every payment request must include clientRequestId. Save it in payments.client_request_id. On duplicate clientRequestId, return existing payment.
+
+Use DB row-level locking on wallet row ( SELECT ... FOR UPDATE ) when reserving funds to avoid races.
+
+Use optimistic concurrency control (version column) where appropriate.
+
+5) Message topics (Kafka)
+
+payment.requests — input accepted payments (for async processing)
+
+payment.results — completed/failed payments
+
+ledger.events — ledger writes for audit/replication
+
+settlement.requests — for settlement batches
+
+notifications — consumed by Notification Service
+
+6) APIs: error codes / retry policy
+
+HTTP 400 — client validation errors (insufficient funds, currency mismatch) — no retry.
+
+HTTP 429 — rate limit — client can retry.
+
+HTTP 5xx — server error — client may retry with same idempotency id.
+
+Use exponential backoff with jitter for retries. All retryable operations must be idempotent.
+
+7) Security & compliance
+
+OAuth2 / JWT tokens for API auth. Validate scopes for wallet actions.
+
+PCI scope: do not store card PANs; use tokenization for any payment card flows.
+
+Data encryption at rest (DB encryption), TLS in transit, Vault for secrets.
+
+8) Notifications / Webhooks
+
+Notification Service should:
+
+Verify merchant webhook URL with registration (signature verification).
+
+Send retries with exponential backoff and a dead-letter queue after N retries.
+
+Provide webhook status in admin UI and audit_events.
+
+9) Monitoring & Observability
+
+Structured logs (JSON), correlation id through the whole flow.
+
+Distributed tracing (OpenTelemetry) propagated via headers.
+
+Metrics: payment throughput, failure rate, settlement amounts, avg latency.
+
+Alerts: failed settlement jobs, spike in compensation events, negative balances.
+
+10) Deployment & infra
+
+Containerize services; deploy on Kubernetes.
+
+Use Horizontal Pod Autoscaler based on CPU and custom metrics (requests/sec).
+
+Use separate DB instances per environment; read replicas for reporting.
+
+Backups: point-in-time recovery for DB; retain ledger backups.
+
+11) Sample sequence diagram (textual)
+
+Client → API-Gateway → Payments Service
+
+Payments Service → Wallet Service (Reserve funds)
+
+Wallet Service (DB tx) writes Ledger ENTRY (PENDING) and updates balances
+
+Payments Service → Merchant Account update (logical credit)
+
+Payments Service marks Payment COMPLETED → publishes payment.completed
+
+Notification Service consumes and notifies merchant + customer
+
+Settlement Service batches payment.completed and calls external Payment Gateway
+
+12) Implementation checklist (practical tasks)
+
+ Define OpenAPI spec for Payment, Wallet, Merchant, Ledger endpoints.
+
+ Implement idempotency middleware in Payments Service.
+
+ Implement account locking (FOR UPDATE) in wallet deductions.
+
+ Implement Saga orchestrator inside Payments Service (or use framework like Axon/Temporal).
+
+ Implement Kafka topics and consumer groups (notification, settlement).
+
+ Build automated tests: unit, integration, contract (consumer-driven), end-to-end.
+
+ Add monitoring dashboards & alerts.
+
+13) Example SQL for reserve step
+BEGIN;
+-- lock wallet
+SELECT available_balance, reserved_balance FROM wallets WHERE wallet_id = 'wallet-001' FOR UPDATE;
+-- check funds if available_balance >= amount
+UPDATE wallets SET available_balance = available_balance - 100, reserved_balance = reserved_balance + 100 WHERE wallet_id='wallet-001';
+INSERT INTO ledger_entries(payment_id, wallet_id, entry_type, amount, currency, status, created_at)
+VALUES('pay-0001','wallet-001','DEBIT',100,'INR','PENDING',now());
+COMMIT;
+
+14) Handling Fees
+
+Calculate fee during post-processing. When payment completes:
+
+Fee = amount * fee_rate.
+
+Merchant credited with amount - fee.
+
+Fee ledger entry credited to wallet operator revenue account.
+
+Be clear whether fee is charged to merchant or payer.
