@@ -1,0 +1,90 @@
+Goals (from the brief)
+
+Allow customers to open/use wallets, check balance, pay merchants. (see page 2). 
+
+e-Wallet_Backend_LBG_8-Nov
+
+Ensure transactional correctness, auditing, notification to merchant, and settlement to merchant bank via gateway. (see page 3). 
+
+e-Wallet_Backend_LBG_8-Nov
+
+Use Spring Boot / microservices, REST/OpenAPI, good logging, DB design, error handling (see page 4). 
+
+e-Wallet_Backend_LBG_8-Nov
+
+System overview (components)
+
+API Gateway
+
+Single entry for REST (routing, auth, rate-limit, TLS termination).
+
+Auth / Identity Service
+
+OAuth2 / JWT issuance, user management.
+
+Wallet Service (core)
+
+Customer profile, wallet balance, business validations.
+
+Payments Service / Transaction Orchestrator
+
+Orchestrates a payment: validation → reserve/deduct → credit merchant ledger → ledger write → post-processing (fees, notifications).
+
+Ledger Service (Transaction Store)
+
+Immutable transactional ledger (audit trail). Prefer RDBMS or append-only store.
+
+Settlement Service
+
+Batches settlement transfers to merchant bank via Payment Gateway.
+
+Merchant Service
+
+Merchant profile/accounts, fee rules.
+
+Notification Service
+
+Push / Email / Webhook notifications to merchants/customers.
+
+Fee Service
+
+Fee calculation and fee accounting.
+
+Audit & Logging / Monitoring
+
+Centralized ELK/EFK + Prometheus + Grafana + distributed tracing (OpenTelemetry).
+
+Config & Secrets
+
+Spring Cloud Config + HashiCorp Vault.
+
+Async Backbone
+
+Kafka (topics: payment.requests, payment.results, ledger.events, settlement.requests, notifications). Use for decoupling and resiliency.
+
+Data flow (high level)
+
+Client → API Gateway → Payments Service /payments.
+
+Payments Service calls Wallet Service (check & reserve funds), Ledger Service (create pending transaction), then asynchronously schedules settlement and notifications.
+
+On success: Wallet balance updated, Merchant credited (logical credit), Notification sent. On failure: compensation (release reserve) and notification.
+(Workflow illustrated on page 2). 
+
+e-Wallet_Backend_LBG_8-Nov
+
+Key non-functional design choices
+
+Strong consistency for money transfers — use database transactions for wallet/ledger changes or use Saga pattern with compensating steps for cross-service operations.
+
+Idempotency — every payment request has clientRequestId and server must support idempotent retries.
+
+Auditability — append-only transaction ledger with full metadata.
+
+Scalability — stateless microservices, horizontal scale, Kafka for high throughput.
+
+Security — TLS, OAuth2, secure secrets, PCI guidelines for any card data.
+
+Observability — request tracing, metrics, structured logs.
+
+Deployment — containerized (Docker) on Kubernetes; rollouts via Helm.
